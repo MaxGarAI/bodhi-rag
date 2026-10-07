@@ -6,9 +6,9 @@
 """
 
 import sys
-from pinecone_client import PineconeVectorClient
+from pinecone_client import PineconeManager, PineconeVectorClient
 
-def search_quotes(client: PineconeVectorClient, query: str, top_k: int = 3):
+def search_quotes(client: PineconeManager, query: str, top_k: int = 3):
     """
     Поиск наиболее подходящих цитат в Pinecone по смыслу вопроса.
     """
@@ -116,14 +116,24 @@ def main():
 
                 import time
                 phrase_id = f"buddhism-user-{int(time.time())}"
-                print(f" Сохраняю новую мысль в Pinecone (ID: {phrase_id})...")
-                client.upsert_text(
+                print(f" Проверяю на дубликаты и сохраняю в Pinecone (ID: {phrase_id})...")
+                res = client.upsert_text(
                     id=phrase_id,
                     text=phrase_text,
                     metadata={"author": "Пользователь", "topic": "Пользовательская мысль", "category": "user_wisdom"},
-                    namespace="buddhism"
+                    namespace="buddhism",
+                    filter_duplicates=True,
                 )
-                print(f" Мысль успешно сохранена в векторизованную базу знаний!\nТекст: «{phrase_text}»")
+                if res.get("is_duplicate"):
+                    dup = res.get("duplicate") or {}
+                    score = dup.get("score", 0.0) * 100
+                    dup_text = dup.get("text") or dup.get("metadata", {}).get("text") or "..."
+                    dup_id = dup.get("id", "")
+                    thresh_pct = res.get("threshold", 0.88) * 100
+                    print(f"⚠️  Мысль НЕ добавлена: обнаружен дубликат (сходство {score:.1f}% >= порога {thresh_pct:.0f}%)!")
+                    print(f"   Существующая запись [{dup_id}]: «{dup_text}»")
+                else:
+                    print(f"✅ Мысль успешно сохранена в векторизованную базу знаний!\nТекст: «{phrase_text}»")
                 print("-" * 60)
                 continue
 

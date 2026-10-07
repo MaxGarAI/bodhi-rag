@@ -1,6 +1,8 @@
 import os
+import time
+import math
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from openai import OpenAI
@@ -12,19 +14,66 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Порог косинусного сходства по умолчанию для автоматической фильтрации дубликатов
+DEFAULT_DUPLICATE_THRESHOLD: float = 0.88
+
+
+def compute_cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """
+    Вычисление косинусного сходства (Cosine Similarity) между двумя векторами.
+
+    Формула:
+        cosine_similarity(A, B) = (A · B) / (||A|| * ||B||)
+
+    Args:
+        vec1: Первый числовой вектор.
+        vec2: Второй числовой вектор.
+
+    Returns:
+        float: Значение косинусного сходства в диапазоне [-1.0, 1.0] (для нормализованных
+               эмбеддингов обычно [0.0, 1.0]). 1.0 означает полную сонаправленность.
+
+    Raises:
+        ValueError: Если векторы имеют разную размерность.
+    """
+    if not vec1 or not vec2:
+        return 0.0
+    if len(vec1) != len(vec2):
+        raise ValueError(
+            f"Размерности векторов не совпадают: {len(vec1)} != {len(vec2)}"
+        )
+
+    dot_product = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for a, b in zip(vec1, vec2):
+        dot_product += a * b
+        norm_a += a * a
+        norm_b += b * b
+
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 0.0
+
+    similarity = dot_product / (math.sqrt(norm_a) * math.sqrt(norm_b))
+    return max(-1.0, min(1.0, float(similarity)))
+
 
 class PineconeVectorClient:
     """
-    Клиент для взаимодействия с векторной базой данных Pinecone
-    с поддержкой генерации эмбеддингов через OpenRouter.
+    Клиент для взаимодействия с векторной базой данных Pinecone (PineconeManager)
+    с поддержкой генерации эмбеддингов через OpenRouter и автоматической
+    фильтрации дубликатов на основе косинусного сходства (Cosine Similarity).
 
     Предоставляет методы для:
       - подключения к базе и индексам Pinecone,
-      - записи (upsert) векторов и текстов,
+      - записи (upsert) векторов и текстов с дедупликацией,
       - чтения (fetch) векторов по ID,
       - семантического поиска (query / search) векторов и текстовых запросов,
+      - проверки наличия дубликатов (find_duplicate),
       - удаления (delete) векторов по ID, фильтрам или полной очистки namespace.
     """
+
+    compute_cosine_similarity = staticmethod(compute_cosine_similarity)
 
     def __init__(
         self,
@@ -32,6 +81,7 @@ class PineconeVectorClient:
         index_name: Optional[str] = None,
         openrouter_api_key: Optional[str] = None,
         default_embedding_model: str = "openai/text-embedding-3-small",
+        duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD,
     ):
         """
         Инициализация клиента Pinecone и OpenRouter.
@@ -45,6 +95,8 @@ class PineconeVectorClient:
                 Если не указан, считывается из переменной окружения OPENROUTER_API_KEY.
             default_embedding_model (str): Название модели эмбеддингов в OpenRouter по умолчанию.
                 По умолчанию: "openai/text-embedding-3-small" (размерность 1536).
+            duplicate_threshold (float): Порог косинусного сходства для отсечения дубликатов.
+                По умолчанию 0.88 или считывается из DUPLICATE_THRESHOLD / SIMILARITY_THRESHOLD.
 
         Raises:
             ValueError: Если ключ Pinecone не найден ни в аргументах, ни в .env.
@@ -62,6 +114,15 @@ class PineconeVectorClient:
 
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
         self.default_embedding_model = default_embedding_model
+
+        # Установка порога косинусного сходства для фильтрации дубликатов
+        env_threshold = os.getenv("DUPLICATE_THRESHOLD") or os.getenv("SIMILARITY_THRESHOLD")
+        try:
+            self.duplicate_threshold = (
+                float(env_threshold) if env_threshold is not None else duplicate_threshold
+            )
+        except ValueError:
+            self.duplicate_threshold = duplicate_threshold
 
         # Инициализация клиента Pinecone
         self.pc = Pinecone(api_key=self.pinecone_api_key)
@@ -91,26 +152,41 @@ class PineconeVectorClient:
     # Подключение и управление индексами
     # --------------------------------------------------------------------------
 
-    def list_indexes(self) -> List[str]:
+    def list_indexes(self, retries: int = 3, delay: float = 1.0) -> List[str]:
         """
-        Получение списка названий всех доступных индексов в аккаунте Pinecone.
+        Получение списка названий всех доступных индексов в аккаунте Pinecone с повторными попытками.
+
+        Args:
+            retries (int): Количество попыток при сбоях сети (по умолчанию 3).
+            delay (float): Задержка в секундах между попытками (по умолчанию 1.0).
 
         Returns:
             List[str]: Список имен индексов (например, ['rag-demo-index', 'test2']).
 
         Raises:
-            Exception: При ошибке обращения к API Pinecone.
+            Exception: При ошибке обращения к API Pinecone после всех попыток.
         """
-        try:
-            indexes = self.pc.list_indexes()
-            return [idx.name for idx in indexes]
-        except Exception as e:
-            logger.error(f"Ошибка при получении списка индексов: {e}")
-            raise
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                indexes = self.pc.list_indexes()
+                return [idx.name for idx in indexes]
+            except Exception as e:
+                last_error = e
+                if attempt < retries:
+                    logger.warning(
+                        f"Временный сбой сети при получении индексов Pinecone (попытка {attempt}/{retries}): {e}. "
+                        f"Повтор через {delay:.1f}с..."
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Ошибка при получении списка индексов после {retries} попыток: {e}")
+        raise last_error
 
     def connect_index(self, index_name: str) -> Any:
         """
         Подключение к существующему индексу Pinecone по его названию.
+        Включает валидацию наличия индекса и устойчивость к кратковременным сетевым сбоям.
 
         Args:
             index_name (str): Название индекса Pinecone.
@@ -123,10 +199,19 @@ class PineconeVectorClient:
             Exception: При ошибке подключения к индексу.
         """
         try:
-            available_indexes = self.list_indexes()
-            if index_name not in available_indexes:
-                raise ValueError(
-                    f"Индекс '{index_name}' не найден. Доступные индексы: {available_indexes}"
+            # Пытаемся проверить наличие индекса в списке аккаунта
+            try:
+                available_indexes = self.list_indexes(retries=2, delay=1.0)
+                if available_indexes and index_name not in available_indexes:
+                    raise ValueError(
+                        f"Индекс '{index_name}' не найден. Доступные индексы: {available_indexes}"
+                    )
+            except ValueError:
+                raise
+            except Exception as net_err:
+                logger.warning(
+                    f"Не удалось получить предварительный список индексов ({net_err}). "
+                    f"Выполняется прямое подключение к индексу '{index_name}'..."
                 )
 
             self.index = self.pc.Index(index_name)
@@ -290,6 +375,8 @@ class PineconeVectorClient:
         include_metadata: bool = True,
         include_values: bool = False,
         namespace: Optional[str] = None,
+        deduplicate: bool = False,
+        duplicate_threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Поиск наиболее похожих векторов в индексе Pinecone по вектору запроса.
@@ -301,6 +388,9 @@ class PineconeVectorClient:
             include_metadata (bool): Включать ли метаданные векторов в результат. По умолчанию True.
             include_values (bool): Включать ли числовые значения векторов в результат. По умолчанию False.
             namespace (Optional[str]): Пространство имен для поиска.
+            deduplicate (bool): Исключать ли близкие дубликаты из результатов поиска (по умолчанию False).
+            duplicate_threshold (Optional[float]): Порог косинусного сходства для отсечения дубликатов
+                (по умолчанию self.duplicate_threshold, 0.88).
 
         Returns:
             List[Dict[str, Any]]: Список найденных совпадений, отсортированный по убыванию сходства.
@@ -321,11 +411,14 @@ class PineconeVectorClient:
             raise ValueError("query_vector не может быть пустым.")
 
         try:
+            fetch_top_k = max(top_k * 2, top_k + 5) if deduplicate else top_k
+            fetch_values = True if deduplicate else include_values
+
             kwargs = {
                 "vector": query_vector,
-                "top_k": top_k,
+                "top_k": fetch_top_k,
                 "include_metadata": include_metadata,
-                "include_values": include_values,
+                "include_values": fetch_values,
             }
             if filter is not None:
                 kwargs["filter"] = filter
@@ -343,14 +436,149 @@ class PineconeVectorClient:
                 }
                 if include_metadata:
                     item["metadata"] = getattr(match, "metadata", None)
-                if include_values:
+                if fetch_values:
                     item["values"] = getattr(match, "values", None)
                 results.append(item)
+
+            if deduplicate:
+                results = self.filter_duplicate_results(
+                    results,
+                    threshold=duplicate_threshold,
+                )
+                if not include_values:
+                    for item in results:
+                        item.pop("values", None)
+                results = results[:top_k]
 
             return results
         except Exception as e:
             logger.error(f"Ошибка при поиске векторов: {e}")
             raise
+
+    # --------------------------------------------------------------------------
+    # Дедупликация и косинусное сходство (Deduplication)
+    # --------------------------------------------------------------------------
+
+    def find_duplicate(
+        self,
+        text: Optional[str] = None,
+        vector: Optional[List[float]] = None,
+        namespace: Optional[str] = None,
+        threshold: Optional[float] = None,
+        model: Optional[str] = None,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Проверка наличия дубликата в индексе Pinecone по косинусному сходству.
+
+        Ищет наиболее похожий вектор в указанном namespace. Если косинусное сходство (score)
+        превышает установленный порог (threshold), возвращает данные найденного дубликата.
+
+        Args:
+            text (Optional[str]): Исходный текст для поиска дубликата (будет векторизован).
+            vector (Optional[List[float]]): Готовый вектор (если эмбеддинг уже вычислен).
+            namespace (Optional[str]): Пространство имен Pinecone.
+            threshold (Optional[float]): Порог косинусного сходства (по умолчанию self.duplicate_threshold, 0.88).
+            model (Optional[str]): Модель эмбеддингов для векторизации text.
+            filter (Optional[Dict[str, Any]]): Фильтр по метаданным.
+
+        Returns:
+            Optional[Dict[str, Any]]: Данные дубликата или None, если дубликат не найден:
+                {
+                    "id": str,
+                    "score": float,
+                    "text": str,
+                    "metadata": Dict[str, Any]
+                }
+        """
+        if vector is None:
+            if not text:
+                raise ValueError("Необходимо указать text или vector для поиска дубликата.")
+            vector = self.get_embedding(text=text, model=model)
+
+        min_threshold = threshold if threshold is not None else self.duplicate_threshold
+
+        matches = self.search_vectors(
+            query_vector=vector,
+            top_k=1,
+            filter=filter,
+            include_metadata=True,
+            include_values=False,
+            namespace=namespace,
+            deduplicate=False,
+        )
+
+        if matches:
+            top_match = matches[0]
+            score = top_match.get("score")
+            if score is not None and score >= min_threshold:
+                meta = top_match.get("metadata") or {}
+                return {
+                    "id": top_match.get("id"),
+                    "score": score,
+                    "text": meta.get("text", ""),
+                    "metadata": meta,
+                }
+
+        return None
+
+    def filter_duplicate_results(
+        self,
+        matches: List[Dict[str, Any]],
+        threshold: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Фильтрация семантических дубликатов из списка результатов поиска.
+
+        Попарно сравнивает результаты с помощью косинусного сходства (Cosine Similarity).
+        Если последующий результат имеет косинусное сходство с уже добавленным результатом
+        выше установленного порога, он отсекается как семантический дубликат.
+
+        Args:
+            matches (List[Dict[str, Any]]): Список результатов поиска.
+            threshold (Optional[float]): Порог косинусного сходства (по умолчанию self.duplicate_threshold).
+
+        Returns:
+            List[Dict[str, Any]]: Список уникальных результатов поиска.
+        """
+        if not matches:
+            return []
+
+        limit_threshold = threshold if threshold is not None else self.duplicate_threshold
+        unique_matches: List[Dict[str, Any]] = []
+
+        # Проверяем наличие векторов в matches
+        needs_embedding = any(not m.get("values") for m in matches)
+        if needs_embedding and self.embedding_client:
+            texts_to_embed = [m.get("metadata", {}).get("text", "") for m in matches]
+            if any(texts_to_embed):
+                try:
+                    embeddings = self.get_embeddings(texts=texts_to_embed)
+                    for m, emb in zip(matches, embeddings):
+                        if not m.get("values"):
+                            m["values"] = emb
+                except Exception as e:
+                    logger.warning(f"Не удалось сгенерировать эмбеддинги для дедупликации: {e}")
+
+        for candidate in matches:
+            cand_vec = candidate.get("values")
+            if not cand_vec:
+                unique_matches.append(candidate)
+                continue
+
+            is_duplicate = False
+            for accepted in unique_matches:
+                acc_vec = accepted.get("values")
+                if acc_vec:
+                    sim = compute_cosine_similarity(cand_vec, acc_vec)
+                    if sim >= limit_threshold:
+                        is_duplicate = True
+                        break
+
+            if not is_duplicate:
+                unique_matches.append(candidate)
+
+        return unique_matches
 
     # --------------------------------------------------------------------------
     # Удаление векторов (Delete)
@@ -496,10 +724,12 @@ class PineconeVectorClient:
         namespace: Optional[str] = None,
         model: Optional[str] = None,
         batch_size: int = 50,
+        filter_duplicates: bool = True,
+        duplicate_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Пакетная запись текстов: вычисляет эмбеддинги для списка записей и
-        сохраняет их в Pinecone с автоматическим батчингом.
+        сохраняет их в Pinecone с опциональной фильтрацией дубликатов по косинусному сходству.
 
         Args:
             items (List[Dict[str, Any]]): Список словарей с текстами.
@@ -510,11 +740,16 @@ class PineconeVectorClient:
             namespace (Optional[str]): Пространство имен Pinecone.
             model (Optional[str]): Модель эмбеддингов OpenRouter.
             batch_size (int): Размер пакета для генерации эмбеддингов и записи. По умолчанию 50.
+            filter_duplicates (bool): Автоматически фильтровать дубликаты перед сохранением (по умолчанию True).
+            duplicate_threshold (Optional[float]): Порог косинусного сходства (по умолчанию self.duplicate_threshold, 0.88).
 
         Returns:
             Dict[str, Any]: Словарь с результатами:
                 - 'upserted_count' (int): Общее число сохраненных векторов.
-                - 'batches_count' (int): Число обработанных пачек.
+                - 'skipped_duplicates_count' (int): Число пропущенных дубликатов.
+                - 'duplicates' (List[Dict[str, Any]]): Список пропущенных дубликатов.
+                - 'batches_count' (int): Число отправленных пакетов.
+                - 'threshold' (float): Порог косинусного сходства.
 
         Raises:
             ValueError: Если items пуст или структура элементов некорректна.
@@ -522,31 +757,92 @@ class PineconeVectorClient:
         if not items:
             raise ValueError("Список items не может быть пустым.")
 
+        threshold = (
+            duplicate_threshold
+            if duplicate_threshold is not None
+            else self.duplicate_threshold
+        )
+
         total_upserted = 0
         total_batches = 0
+        skipped_duplicates: List[Dict[str, Any]] = []
+
+        accepted_records: List[Dict[str, Any]] = []
+        accepted_vectors: List[List[float]] = []
 
         for i in range(0, len(items), batch_size):
             chunk = items[i : i + batch_size]
             texts = [item["text"] for item in chunk]
             embeddings = self.get_embeddings(texts=texts, model=model)
 
-            vectors_to_upsert = []
+            batch_to_upsert = []
             for item, emb in zip(chunk, embeddings):
                 meta = item.get("metadata", {}).copy() if item.get("metadata") else {}
                 meta["text"] = item["text"]
-                vectors_to_upsert.append({
+
+                if filter_duplicates:
+                    # 1. Проверка на дубликаты среди уже отобранных векторов в текущей сессии
+                    is_in_batch_dup = False
+                    for prev_item, prev_vec in zip(accepted_records, accepted_vectors):
+                        sim = compute_cosine_similarity(emb, prev_vec)
+                        if sim >= threshold:
+                            is_in_batch_dup = True
+                            skipped_duplicates.append({
+                                "id": item["id"],
+                                "text": item["text"],
+                                "reason": "in_batch_duplicate",
+                                "similarity": sim,
+                                "matched_id": prev_item["id"],
+                            })
+                            logger.info(
+                                f"Пропущен дубликат в батче: '{item['id']}' сходен с '{prev_item['id']}' "
+                                f"({sim:.4f} >= {threshold})"
+                            )
+                            break
+
+                    if is_in_batch_dup:
+                        continue
+
+                    # 2. Проверка на наличие похожего вектора в существующей базе данных Pinecone
+                    db_dup = self.find_duplicate(
+                        vector=emb,
+                        namespace=namespace,
+                        threshold=threshold,
+                    )
+                    if db_dup:
+                        skipped_duplicates.append({
+                            "id": item["id"],
+                            "text": item["text"],
+                            "reason": "database_duplicate",
+                            "similarity": db_dup["score"],
+                            "matched_id": db_dup["id"],
+                            "matched_text": db_dup.get("text"),
+                        })
+                        logger.info(
+                            f"Пропущен дубликат из базы: '{item['id']}' сходен с '{db_dup['id']}' "
+                            f"({db_dup['score']:.4f} >= {threshold})"
+                        )
+                        continue
+
+                accepted_records.append(item)
+                accepted_vectors.append(emb)
+                batch_to_upsert.append({
                     "id": item["id"],
                     "values": emb,
                     "metadata": meta,
                 })
 
-            res = self.upsert_vectors(vectors=vectors_to_upsert, namespace=namespace)
-            total_upserted += res.get("upserted_count", len(vectors_to_upsert))
-            total_batches += 1
+            if batch_to_upsert:
+                res = self.upsert_vectors(vectors=batch_to_upsert, namespace=namespace)
+                total_upserted += res.get("upserted_count", len(batch_to_upsert))
+                total_batches += 1
 
         return {
             "upserted_count": total_upserted,
+            "skipped_duplicates_count": len(skipped_duplicates),
+            "duplicates": skipped_duplicates,
             "batches_count": total_batches,
+            "threshold": threshold,
         }
 
     def upsert_text(
@@ -556,10 +852,12 @@ class PineconeVectorClient:
         metadata: Optional[Dict[str, Any]] = None,
         namespace: Optional[str] = None,
         model: Optional[str] = None,
+        filter_duplicates: bool = True,
+        duplicate_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Высокоуровневый метод: создание эмбеддинга текста через OpenRouter и
-        сохранение вектора и исходного текста в Pinecone.
+        сохранение вектора и исходного текста в Pinecone с автоматической фильтрацией дубликатов.
 
         Args:
             id (str): Уникальный идентификатор записи.
@@ -568,11 +866,60 @@ class PineconeVectorClient:
                 Поле "text" автоматически добавляется/перезаписывается исходным текстом.
             namespace (Optional[str]): Пространство имен Pinecone.
             model (Optional[str]): Модель эмбеддингов OpenRouter.
+            filter_duplicates (bool): Автоматически проверять наличие дубликатов перед записью.
+                По умолчанию True.
+            duplicate_threshold (Optional[float]): Порог косинусного сходства для отсечения дубликатов.
+                Если не указан, используется self.duplicate_threshold (по умолчанию 0.88).
 
         Returns:
-            Dict[str, Any]: Результат выполнения upsert_vectors.
+            Dict[str, Any]: Результат выполнения:
+                - При обнаружении дубликата (при filter_duplicates=True):
+                    {
+                        "status": "duplicate_skipped",
+                        "upserted_count": 0,
+                        "is_duplicate": True,
+                        "duplicate": Dict[str, Any],
+                        "threshold": float,
+                        "id": str,
+                        "text": str
+                    }
+                - При успешном добавлении:
+                    {
+                        "status": "success",
+                        "upserted_count": 1,
+                        "is_duplicate": False,
+                        "id": str,
+                        "text": str
+                    }
         """
+        threshold = (
+            duplicate_threshold
+            if duplicate_threshold is not None
+            else self.duplicate_threshold
+        )
         vector = self.get_embedding(text=text, model=model)
+
+        if filter_duplicates:
+            duplicate = self.find_duplicate(
+                vector=vector,
+                namespace=namespace,
+                threshold=threshold,
+            )
+            if duplicate:
+                logger.info(
+                    f"Пропущен дубликат текста (сходство {duplicate['score']:.4f} >= {threshold}): "
+                    f"совпадает с ID '{duplicate['id']}'"
+                )
+                return {
+                    "status": "duplicate_skipped",
+                    "upserted_count": 0,
+                    "is_duplicate": True,
+                    "duplicate": duplicate,
+                    "threshold": threshold,
+                    "id": id,
+                    "text": text,
+                }
+
         meta = metadata.copy() if metadata else {}
         meta["text"] = text
 
@@ -581,7 +928,14 @@ class PineconeVectorClient:
             "values": vector,
             "metadata": meta,
         }
-        return self.upsert_vectors(vectors=[record], namespace=namespace)
+        res = self.upsert_vectors(vectors=[record], namespace=namespace)
+        return {
+            "status": "success",
+            "upserted_count": res.get("upserted_count", 1),
+            "is_duplicate": False,
+            "id": id,
+            "text": text,
+        }
 
     def search_by_text(
         self,
@@ -591,6 +945,8 @@ class PineconeVectorClient:
         include_metadata: bool = True,
         namespace: Optional[str] = None,
         model: Optional[str] = None,
+        deduplicate: bool = False,
+        duplicate_threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Высокоуровневый метод: поиск наиболее релевантных векторов по текстовому запросу.
@@ -603,6 +959,8 @@ class PineconeVectorClient:
             include_metadata (bool): Возвращать ли метаданные найденных записей. По умолчанию True.
             namespace (Optional[str]): Пространство имен для поиска.
             model (Optional[str]): Модель эмбеддингов для векторизации запроса.
+            deduplicate (bool): Исключать ли близкие дубликаты из результатов (по умолчанию False).
+            duplicate_threshold (Optional[float]): Порог косинусного сходства для исключения дубликатов.
 
         Returns:
             List[Dict[str, Any]]: Список найденных результатов с полями 'id', 'score' и 'metadata'.
@@ -615,6 +973,8 @@ class PineconeVectorClient:
             include_metadata=include_metadata,
             include_values=False,
             namespace=namespace,
+            deduplicate=deduplicate,
+            duplicate_threshold=duplicate_threshold,
         )
 
     # --------------------------------------------------------------------------
@@ -628,5 +988,16 @@ class PineconeVectorClient:
         if self.index is None:
             raise RuntimeError(
                 "Индекс Pinecone не подключен. Сначала вызовите connect_index(index_name) "
-                "или передайте index_name при создании экземпляра PineconeVectorClient."
+                "или передайте index_name при создании экземпляра PineconeManager / PineconeVectorClient."
             )
+
+
+# Алиас класса для совместимости и лаконичности
+PineconeManager = PineconeVectorClient
+
+__all__ = [
+    "PineconeManager",
+    "PineconeVectorClient",
+    "compute_cosine_similarity",
+    "DEFAULT_DUPLICATE_THRESHOLD",
+]

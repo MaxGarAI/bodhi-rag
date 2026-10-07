@@ -28,7 +28,7 @@ from telegram.ext import (
     filters,
 )
 
-from pinecone_client import PineconeVectorClient
+from pinecone_client import PineconeManager, PineconeVectorClient
 
 # Загружаем переменные из .env
 load_dotenv()
@@ -48,8 +48,8 @@ NAMESPACE = "buddhism"
 if not TELEGRAM_KEY:
     raise ValueError("TELEGRAM_KEY не найден в файле .env!")
 
-# Инициализация клиента Pinecone
-pinecone_client = PineconeVectorClient(index_name=INDEX_NAME)
+# Инициализация менеджера Pinecone
+pinecone_client = PineconeManager(index_name=INDEX_NAME)
 
 # Триггеры для сохранения новых мыслей
 SAVE_TRIGGERS = (
@@ -231,7 +231,7 @@ async def process_save_phrase(update: Update, phrase_text: str):
     status_msg = await update.message.reply_text("⏳ <i>Векторизую и сохраняю в Pinecone...</i>", parse_mode=ParseMode.HTML)
 
     try:
-        await asyncio.to_thread(
+        res = await asyncio.to_thread(
             pinecone_client.upsert_text,
             id=phrase_id,
             text=phrase_text,
@@ -243,7 +243,28 @@ async def process_save_phrase(update: Update, phrase_text: str):
                 "date": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
             namespace=NAMESPACE,
+            filter_duplicates=True,
         )
+
+        if res.get("is_duplicate"):
+            dup = res.get("duplicate") or {}
+            dup_meta = dup.get("metadata") or {}
+            dup_text = dup.get("text") or dup_meta.get("text") or "..."
+            dup_author = dup_meta.get("author") or "Неизвестен"
+            dup_id = dup.get("id") or "..."
+            dup_score = dup.get("score", 0.0) * 100
+            threshold_pct = res.get("threshold", 0.88) * 100
+
+            warning_text = (
+                "⚠️ <b>Похожая мысль уже есть в базе знаний!</b>\n\n"
+                f"📊 Косинусное сходство: <b>{dup_score:.1f}%</b> (порог: {threshold_pct:.0f}%)\n"
+                f"📝 <b>Существующая запись:</b> «{dup_text}»\n"
+                f"👤 <b>Автор:</b> {dup_author}\n"
+                f"🔑 <b>ID:</b> <code>{dup_id}</code>\n\n"
+                "🛡️ <i>Запись автоматически отфильтрована во избежание дублирования данных.</i>"
+            )
+            await status_msg.edit_text(warning_text, parse_mode=ParseMode.HTML)
+            return
 
         success_text = (
             "✅ <b>Фраза успешно сохранена в базу знаний!</b>\n\n"
