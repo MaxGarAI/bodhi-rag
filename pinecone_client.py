@@ -10,9 +10,22 @@ from openai import OpenAI
 # Загружаем переменные окружения из .env файла
 load_dotenv()
 
-# Настройка базового логирования
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# Настройка логирования: консоль + файл deduplication.log
+LOG_FILE = os.getenv("LOG_FILE", "deduplication.log")
+
+logger = logging.getLogger("bodhi_rag")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    _formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    _file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _file_handler.setFormatter(_formatter)
+    logger.addHandler(_file_handler)
+
+    _stream_handler = logging.StreamHandler()
+    _stream_handler.setFormatter(_formatter)
+    logger.addHandler(_stream_handler)
 
 # Порог косинусного сходства по умолчанию для автоматической фильтрации дубликатов
 DEFAULT_DUPLICATE_THRESHOLD: float = 0.88
@@ -80,11 +93,13 @@ class PineconeVectorClient:
         pinecone_api_key: Optional[str] = None,
         index_name: Optional[str] = None,
         openrouter_api_key: Optional[str] = None,
+        openai_api_key: Optional[str] = None,
+        openai_base_url: Optional[str] = None,
         default_embedding_model: str = "openai/text-embedding-3-small",
         duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD,
     ):
         """
-        Инициализация клиента Pinecone и OpenRouter.
+        Инициализация клиента Pinecone и OpenAI/OpenRouter с поддержкой OPENAI_BASE_URL.
 
         Args:
             pinecone_api_key (Optional[str]): API-ключ Pinecone. Если не указан,
@@ -92,8 +107,12 @@ class PineconeVectorClient:
             index_name (Optional[str]): Имя индекса для автоматического подключения.
                 Если не указано, подключение можно выполнить позже вызовом connect_index().
             openrouter_api_key (Optional[str]): API-ключ OpenRouter для генерации эмбеддингов.
-                Если не указан, считывается из переменной окружения OPENROUTER_API_KEY.
-            default_embedding_model (str): Название модели эмбеддингов в OpenRouter по умолчанию.
+                Если не указан, считывается из OPENROUTER_API_KEY или OPENAI_API_KEY.
+            openai_api_key (Optional[str]): API-ключ OpenAI (альтернатива openrouter_api_key).
+            openai_base_url (Optional[str]): Базовый URL для OpenAI-совместимого API.
+                Если не указан, считывается из переменной OPENAI_BASE_URL или OPENROUTER_BASE_URL.
+                По умолчанию: "https://openrouter.ai/api/v1".
+            default_embedding_model (str): Название модели эмбеддингов по умолчанию.
                 По умолчанию: "openai/text-embedding-3-small" (размерность 1536).
             duplicate_threshold (float): Порог косинусного сходства для отсечения дубликатов.
                 По умолчанию 0.88 или считывается из DUPLICATE_THRESHOLD / SIMILARITY_THRESHOLD.
@@ -112,7 +131,23 @@ class PineconeVectorClient:
                 "или установите переменную PINECONE_KEY в файле .env"
             )
 
-        self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        # Разрешение API-ключа для эмбеддингов: OPENAI_API_KEY или OPENROUTER_API_KEY
+        self.api_key = (
+            openai_api_key
+            or openrouter_api_key
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("OPENROUTER_API_KEY")
+        )
+        self.openrouter_api_key = self.api_key
+        self.openai_api_key = self.api_key
+
+        # Разрешение базового URL: параметр -> OPENAI_BASE_URL -> OPENROUTER_BASE_URL -> OpenRouter default
+        self.openai_base_url = (
+            openai_base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("OPENROUTER_BASE_URL")
+            or "https://openrouter.ai/api/v1"
+        )
         self.default_embedding_model = default_embedding_model
 
         # Установка порога косинусного сходства для фильтрации дубликатов
@@ -129,20 +164,26 @@ class PineconeVectorClient:
         self.index = None
         self.current_index_name: Optional[str] = None
 
-        # Инициализация клиента OpenRouter (для генерации эмбеддингов)
+        # Инициализация клиента OpenAI / OpenRouter (для генерации эмбеддингов и генерации текста)
         self.embedding_client: Optional[OpenAI] = None
-        if self.openrouter_api_key:
-            self.embedding_client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=self.openrouter_api_key,
-                default_headers={
+        if self.api_key:
+            headers = {}
+            if "openrouter.ai" in self.openai_base_url:
+                headers = {
                     "HTTP-Referer": "http://localhost",
                     "X-Title": "Bot_RAG",
-                },
+                }
+            self.embedding_client = OpenAI(
+                base_url=self.openai_base_url,
+                api_key=self.api_key,
+                default_headers=headers or None,
+            )
+            logger.info(
+                f"Клиент эмбеддингов инициализирован (base_url: '{self.openai_base_url}', модель: '{self.default_embedding_model}')"
             )
         else:
             logger.warning(
-                "OPENROUTER_API_KEY не задан. Функции генерации эмбеддингов будут недоступны."
+                "OPENAI_API_KEY / OPENROUTER_API_KEY не задан. Функции генерации эмбеддингов будут недоступны."
             )
 
         if index_name:
@@ -726,6 +767,7 @@ class PineconeVectorClient:
         batch_size: int = 50,
         filter_duplicates: bool = True,
         duplicate_threshold: Optional[float] = None,
+        on_duplicate: str = "skip",
     ) -> Dict[str, Any]:
         """
         Пакетная запись текстов: вычисляет эмбеддинги для списка записей и
@@ -738,16 +780,18 @@ class PineconeVectorClient:
                   - "text" (str): Текст документа/фразы.
                   - "metadata" (Optional[Dict[str, Any]]): Дополнительные метаданные (опционально).
             namespace (Optional[str]): Пространство имен Pinecone.
-            model (Optional[str]): Модель эмбеддингов OpenRouter.
+            model (Optional[str]): Модель эмбеддингов.
             batch_size (int): Размер пакета для генерации эмбеддингов и записи. По умолчанию 50.
             filter_duplicates (bool): Автоматически фильтровать дубликаты перед сохранением (по умолчанию True).
             duplicate_threshold (Optional[float]): Порог косинусного сходства (по умолчанию self.duplicate_threshold, 0.88).
+            on_duplicate (str): Действие при обнаружении дубликата: "skip" (по умолчанию) или "update".
 
         Returns:
             Dict[str, Any]: Словарь с результатами:
-                - 'upserted_count' (int): Общее число сохраненных векторов.
+                - 'upserted_count' (int): Общее число сохраненных/обновленных векторов.
                 - 'skipped_duplicates_count' (int): Число пропущенных дубликатов.
-                - 'duplicates' (List[Dict[str, Any]]): Список пропущенных дубликатов.
+                - 'updated_duplicates_count' (int): Число обновленных дубликатов.
+                - 'duplicates' (List[Dict[str, Any]]): Список дубликатов.
                 - 'batches_count' (int): Число отправленных пакетов.
                 - 'threshold' (float): Порог косинусного сходства.
 
@@ -766,6 +810,7 @@ class PineconeVectorClient:
         total_upserted = 0
         total_batches = 0
         skipped_duplicates: List[Dict[str, Any]] = []
+        updated_duplicates: List[Dict[str, Any]] = []
 
         accepted_records: List[Dict[str, Any]] = []
         accepted_vectors: List[List[float]] = []
@@ -787,17 +832,26 @@ class PineconeVectorClient:
                         sim = compute_cosine_similarity(emb, prev_vec)
                         if sim >= threshold:
                             is_in_batch_dup = True
-                            skipped_duplicates.append({
-                                "id": item["id"],
-                                "text": item["text"],
-                                "reason": "in_batch_duplicate",
-                                "similarity": sim,
-                                "matched_id": prev_item["id"],
-                            })
-                            logger.info(
-                                f"Пропущен дубликат в батче: '{item['id']}' сходен с '{prev_item['id']}' "
-                                f"({sim:.4f} >= {threshold})"
-                            )
+                            if on_duplicate == "update":
+                                logger.info(
+                                    f"action: updated | in_batch_duplicate of '{prev_item['id']}' | similarity: {sim:.4f} >= {threshold} | text: '{item['text']}'"
+                                )
+                                updated_duplicates.append({
+                                    "id": prev_item["id"],
+                                    "text": item["text"],
+                                    "similarity": sim,
+                                })
+                            else:
+                                logger.info(
+                                    f"action: skipped | in_batch_duplicate of '{prev_item['id']}' | similarity: {sim:.4f} >= {threshold} | text: '{item['text']}'"
+                                )
+                                skipped_duplicates.append({
+                                    "id": item["id"],
+                                    "text": item["text"],
+                                    "reason": "in_batch_duplicate",
+                                    "similarity": sim,
+                                    "matched_id": prev_item["id"],
+                                })
                             break
 
                     if is_in_batch_dup:
@@ -810,20 +864,37 @@ class PineconeVectorClient:
                         threshold=threshold,
                     )
                     if db_dup:
-                        skipped_duplicates.append({
-                            "id": item["id"],
-                            "text": item["text"],
-                            "reason": "database_duplicate",
-                            "similarity": db_dup["score"],
-                            "matched_id": db_dup["id"],
-                            "matched_text": db_dup.get("text"),
-                        })
-                        logger.info(
-                            f"Пропущен дубликат из базы: '{item['id']}' сходен с '{db_dup['id']}' "
-                            f"({db_dup['score']:.4f} >= {threshold})"
-                        )
+                        if on_duplicate == "update":
+                            meta["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            batch_to_upsert.append({
+                                "id": db_dup["id"],
+                                "values": emb,
+                                "metadata": meta,
+                            })
+                            logger.info(
+                                f"action: updated | id: '{db_dup['id']}' | similarity: {db_dup['score']:.4f} >= {threshold} | text: '{item['text']}'"
+                            )
+                            updated_duplicates.append({
+                                "id": db_dup["id"],
+                                "text": item["text"],
+                                "similarity": db_dup["score"],
+                            })
+                        else:
+                            logger.info(
+                                f"action: skipped | duplicate of id: '{db_dup['id']}' | similarity: {db_dup['score']:.4f} >= {threshold} | text: '{item['text']}'"
+                            )
+                            skipped_duplicates.append({
+                                "id": item["id"],
+                                "text": item["text"],
+                                "reason": "database_duplicate",
+                                "similarity": db_dup["score"],
+                                "matched_id": db_dup["id"],
+                                "matched_text": db_dup.get("text"),
+                            })
                         continue
 
+                # Новый уникальный элемент
+                logger.info(f"action: created | id: '{item['id']}' | text: '{item['text']}'")
                 accepted_records.append(item)
                 accepted_vectors.append(emb)
                 batch_to_upsert.append({
@@ -840,6 +911,7 @@ class PineconeVectorClient:
         return {
             "upserted_count": total_upserted,
             "skipped_duplicates_count": len(skipped_duplicates),
+            "updated_duplicates_count": len(updated_duplicates),
             "duplicates": skipped_duplicates,
             "batches_count": total_batches,
             "threshold": threshold,
@@ -854,9 +926,10 @@ class PineconeVectorClient:
         model: Optional[str] = None,
         filter_duplicates: bool = True,
         duplicate_threshold: Optional[float] = None,
+        on_duplicate: str = "skip",
     ) -> Dict[str, Any]:
         """
-        Высокоуровневый метод: создание эмбеддинга текста через OpenRouter и
+        Высокоуровневый метод: создание эмбеддинга текста через OpenAI/OpenRouter и
         сохранение вектора и исходного текста в Pinecone с автоматической фильтрацией дубликатов.
 
         Args:
@@ -865,16 +938,20 @@ class PineconeVectorClient:
             metadata (Optional[Dict[str, Any]]): Дополнительные метаданные.
                 Поле "text" автоматически добавляется/перезаписывается исходным текстом.
             namespace (Optional[str]): Пространство имен Pinecone.
-            model (Optional[str]): Модель эмбеддингов OpenRouter.
+            model (Optional[str]): Модель эмбеддингов.
             filter_duplicates (bool): Автоматически проверять наличие дубликатов перед записью.
                 По умолчанию True.
             duplicate_threshold (Optional[float]): Порог косинусного сходства для отсечения дубликатов.
                 Если не указан, используется self.duplicate_threshold (по умолчанию 0.88).
+            on_duplicate (str): Действие при обнаружении дубликата:
+                - "skip" (по умолчанию): отсечь дубликат, логировать 'action: skipped'.
+                - "update": обновить существующую запись в базе новыми данными/вектором, логировать 'action: updated'.
 
         Returns:
             Dict[str, Any]: Результат выполнения:
-                - При обнаружении дубликата (при filter_duplicates=True):
+                - При пропуске дубликата (on_duplicate="skip"):
                     {
+                        "action": "skipped",
                         "status": "duplicate_skipped",
                         "upserted_count": 0,
                         "is_duplicate": True,
@@ -883,8 +960,20 @@ class PineconeVectorClient:
                         "id": str,
                         "text": str
                     }
-                - При успешном добавлении:
+                - При обновлении дубликата (on_duplicate="update"):
                     {
+                        "action": "updated",
+                        "status": "updated",
+                        "upserted_count": 1,
+                        "is_duplicate": True,
+                        "duplicate": Dict[str, Any],
+                        "threshold": float,
+                        "id": str,
+                        "text": str
+                    }
+                - При создании новой записи:
+                    {
+                        "action": "created",
                         "status": "success",
                         "upserted_count": 1,
                         "is_duplicate": False,
@@ -906,19 +995,45 @@ class PineconeVectorClient:
                 threshold=threshold,
             )
             if duplicate:
-                logger.info(
-                    f"Пропущен дубликат текста (сходство {duplicate['score']:.4f} >= {threshold}): "
-                    f"совпадает с ID '{duplicate['id']}'"
-                )
-                return {
-                    "status": "duplicate_skipped",
-                    "upserted_count": 0,
-                    "is_duplicate": True,
-                    "duplicate": duplicate,
-                    "threshold": threshold,
-                    "id": id,
-                    "text": text,
-                }
+                target_id = duplicate["id"]
+                if on_duplicate == "update":
+                    meta = metadata.copy() if metadata else {}
+                    meta["text"] = text
+                    meta["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                    record = {
+                        "id": target_id,
+                        "values": vector,
+                        "metadata": meta,
+                    }
+                    res = self.upsert_vectors(vectors=[record], namespace=namespace)
+                    logger.info(
+                        f"action: updated | id: '{target_id}' | similarity: {duplicate['score']:.4f} >= threshold: {threshold} | text: '{text}'"
+                    )
+                    return {
+                        "action": "updated",
+                        "status": "updated",
+                        "upserted_count": res.get("upserted_count", 1),
+                        "is_duplicate": True,
+                        "duplicate": duplicate,
+                        "threshold": threshold,
+                        "id": target_id,
+                        "text": text,
+                    }
+                else:
+                    logger.info(
+                        f"action: skipped | duplicate of id: '{target_id}' | similarity: {duplicate['score']:.4f} >= threshold: {threshold} | text: '{text}'"
+                    )
+                    return {
+                        "action": "skipped",
+                        "status": "duplicate_skipped",
+                        "upserted_count": 0,
+                        "is_duplicate": True,
+                        "duplicate": duplicate,
+                        "threshold": threshold,
+                        "id": id,
+                        "text": text,
+                    }
 
         meta = metadata.copy() if metadata else {}
         meta["text"] = text
@@ -929,7 +1044,9 @@ class PineconeVectorClient:
             "metadata": meta,
         }
         res = self.upsert_vectors(vectors=[record], namespace=namespace)
+        logger.info(f"action: created | id: '{id}' | text: '{text}'")
         return {
+            "action": "created",
             "status": "success",
             "upserted_count": res.get("upserted_count", 1),
             "is_duplicate": False,

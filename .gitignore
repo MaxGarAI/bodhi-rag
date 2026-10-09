@@ -17,4 +17,5 @@ env/
 
 # Logs & temp
 *.log
+!deduplication.log
 scratch/

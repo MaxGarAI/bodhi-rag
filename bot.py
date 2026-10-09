@@ -33,12 +33,19 @@ from pinecone_client import PineconeManager, PineconeVectorClient
 # Загружаем переменные из .env
 load_dotenv()
 
-# Настройка логирования
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# Настройка логирования: консоль + deduplication.log
+LOG_FILE = os.getenv("LOG_FILE", "deduplication.log")
+logger = logging.getLogger("bodhi_rag")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    _formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    _file_h = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _file_h.setFormatter(_formatter)
+    logger.addHandler(_file_h)
+    _stream_h = logging.StreamHandler()
+    _stream_h.setFormatter(_formatter)
+    logger.addHandler(_stream_h)
 
 # Инициализация переменных окружения
 TELEGRAM_KEY = os.getenv("TELEGRAM_KEY") or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -78,6 +85,25 @@ def extract_save_text(message_text: str) -> str:
     return ""
 
 
+def is_question_message(text: str) -> bool:
+    """
+    Определяет, является ли сообщение вопросом для RAG-ответа,
+    или утверждением/мыслью для сохранения в Pinecone с проверкой дедупликации.
+    """
+    stripped = text.strip()
+    if stripped.endswith("?"):
+        return True
+
+    lower = stripped.lower()
+    question_starters = (
+        "как ", "что ", "почему ", "зачем ", "где ", "когда ", "кто ", "куда ",
+        "откуда ", "какой ", "какая ", "какие ", "какое ", "сколько ",
+        "подскажи", "расскажи", "объясни", "посоветуй", "помоги", "в чем ",
+        "правда ли", "можно ли", "стоит ли", "бывает ли"
+    )
+    return any(lower.startswith(q) for q in question_starters)
+
+
 # ------------------------------------------------------------------------------
 # Обработчики команд
 # ------------------------------------------------------------------------------
@@ -93,12 +119,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Я — бот-наставник по <b>буддийской философии и осознанности</b>.\n"
         "Моя база знаний сохранена в векторной базе <b>Pinecone</b> и готова помочь вам найти внутренний покой.\n\n"
         "<b>Что я умею:</b>\n"
-        "1. <b>Отвечать на вопросы</b> — просто напишите любой вопрос (например: <i>«Как справиться с тревогой?»</i> или <i>«Что делать со злостью?»</i>).\n"
-        "2. <b>Запоминать новые фразы</b> — напишите:\n"
-        "   • <code>Запомни: Спокойствие рождается изнутри</code>\n"
-        "   • <code>Запиши: Каждое утро мы рождаемся заново</code>\n"
-        "   • или команду <code>/add Ваш текст</code>\n\n"
+        "1. <b>Сохранять новые мысли и цитаты:</b>\n"
+        "   • Просто отправьте фразу в чат (например: <code>Спокойствие рождается изнутри</code>) "
+        "или напишите <code>Запомни: ...</code> / команду <code>/add ...</code>.\n"
+        "   • Включена <b>автоматическая дедупликация</b> (Cosine Similarity): дубликаты отсекаются с логированием <code>action: skipped</code> или <code>action: updated</code>!\n\n"
+        "2. <b>Отвечать на вопросы (RAG):</b>\n"
+        "   • Задайте вопрос со знаком вопроса <b>?</b> (например: <i>«Как справиться с тревогой?»</i>) "
+        "или используйте команду <code>/ask &lt;вопрос&gt;</code>.\n\n"
         "<b>Команды:</b>\n"
+        "• /ask &lt;вопрос&gt; — задать вопрос мудрецу (RAG-генерация)\n"
+        "• /add &lt;текст&gt; — сохранить цитату в базу\n"
         "• /search &lt;запрос&gt; — чистый векторный поиск похожих цитат\n"
         "• /stats — количество векторов и статус базы знаний\n"
         "• /help — подробная справка"
@@ -112,16 +142,32 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     help_text = (
         "📖 <b>Как пользоваться ботом:</b>\n\n"
-        "• <b>Задать вопрос:</b> Просто напишите мне то, что вас волнует. "
-        "Я найду близкие по смыслу учения в Pinecone и сформулирую ответ.\n\n"
-        "• <b>Добавить мудрость:</b> Начните фразу со слов <i>«Запомни»</i>, <i>«Запиши»</i>, <i>«Добавь»</i> или используйте:\n"
-        "  <code>/add Не привязывайся к результату</code>\n\n"
+        "• <b>Добавить мудрость:</b> Просто отправьте мне цитату или мысль (или используйте <code>/add ...</code> / <i>«Запомни: ...»</i>). "
+        "Бот проверит её на дубликаты в Pinecone: уникальные сохраняются (<code>action: created</code>), повторы отсекаются (<code>action: skipped</code>).\n\n"
+        "• <b>Задать вопрос:</b> Напишите вопрос со знаком вопроса <b>?</b> (например: <i>«Что делать со злостью?»</i>) или:\n"
+        "  <code>/ask Как найти внутренний покой?</code>\n\n"
         "• <b>Векторный поиск:</b>\n"
         "  <code>/search медитация и спокойствие</code>\n\n"
-        "• <b>Статистика:</b>\n"
+        "• <b>Статистика базы знаний:</b>\n"
         "  <code>/stats</code>"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Команда /ask <вопрос> — явный вопрос к базе знаний с RAG-генерацией.
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Пожалуйста, укажите вопрос после команды.\n"
+            "Пример: <code>/ask Как перестать тревожиться о будущем?</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    query = " ".join(context.args).strip()
+    await handle_rag_question(update, context, query)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,7 +266,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_save_phrase(update: Update, phrase_text: str):
     """
-    Логика векторизации и сохранения фразы в Pinecone.
+    Логика векторизации и сохранения фразы в Pinecone с проверкой дедупликации.
     """
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -228,7 +274,7 @@ async def process_save_phrase(update: Update, phrase_text: str):
 
     phrase_id = f"buddhism-user-{int(time.time())}"
 
-    status_msg = await update.message.reply_text("⏳ <i>Векторизую и сохраняю в Pinecone...</i>", parse_mode=ParseMode.HTML)
+    status_msg = await update.message.reply_text("⏳ <i>Проверяю дедупликацию и сохраняю в Pinecone...</i>", parse_mode=ParseMode.HTML)
 
     try:
         res = await asyncio.to_thread(
@@ -244,9 +290,12 @@ async def process_save_phrase(update: Update, phrase_text: str):
             },
             namespace=NAMESPACE,
             filter_duplicates=True,
+            on_duplicate="skip",
         )
 
-        if res.get("is_duplicate"):
+        action = res.get("action", "created")
+
+        if action == "skipped":
             dup = res.get("duplicate") or {}
             dup_meta = dup.get("metadata") or {}
             dup_text = dup.get("text") or dup_meta.get("text") or "..."
@@ -256,7 +305,7 @@ async def process_save_phrase(update: Update, phrase_text: str):
             threshold_pct = res.get("threshold", 0.88) * 100
 
             warning_text = (
-                "⚠️ <b>Похожая мысль уже есть в базе знаний!</b>\n\n"
+                "⚠️ <b>Похожая мысль уже есть в базе знаний! [action: skipped]</b>\n\n"
                 f"📊 Косинусное сходство: <b>{dup_score:.1f}%</b> (порог: {threshold_pct:.0f}%)\n"
                 f"📝 <b>Существующая запись:</b> «{dup_text}»\n"
                 f"👤 <b>Автор:</b> {dup_author}\n"
@@ -266,14 +315,28 @@ async def process_save_phrase(update: Update, phrase_text: str):
             await status_msg.edit_text(warning_text, parse_mode=ParseMode.HTML)
             return
 
-        success_text = (
-            "✅ <b>Фраза успешно сохранена в базу знаний!</b>\n\n"
-            f"📝 <b>Текст:</b> «{phrase_text}»\n"
-            f"👤 <b>Автор:</b> {author_name}\n"
-            f"🔑 <b>ID:</b> <code>{phrase_id}</code>\n\n"
-            "✨ Теперь эта мысль участвует в поиске и будет использоваться в ответах на вопросы!"
-        )
-        await status_msg.edit_text(success_text, parse_mode=ParseMode.HTML)
+        elif action == "updated":
+            dup = res.get("duplicate") or {}
+            dup_score = dup.get("score", 0.0) * 100
+            updated_text = (
+                "🔄 <b>Запись успешно обновлена! [action: updated]</b>\n\n"
+                f"📊 Обнаружено сходство: <b>{dup_score:.1f}%</b>\n"
+                f"📝 <b>Обновленный текст:</b> «{phrase_text}»\n"
+                f"👤 <b>Автор:</b> {author_name}\n"
+                f"🔑 <b>ID:</b> <code>{res.get('id', phrase_id)}</code>"
+            )
+            await status_msg.edit_text(updated_text, parse_mode=ParseMode.HTML)
+            return
+
+        else:
+            success_text = (
+                "✅ <b>Фраза успешно сохранена в базу знаний! [action: created]</b>\n\n"
+                f"📝 <b>Текст:</b> «{phrase_text}»\n"
+                f"👤 <b>Автор:</b> {author_name}\n"
+                f"🔑 <b>ID:</b> <code>{phrase_id}</code>\n\n"
+                "✨ Теперь эта мысль участвует в поиске и будет использоваться в ответах на вопросы!"
+            )
+            await status_msg.edit_text(success_text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Ошибка сохранения фразы: {e}")
         await status_msg.edit_text(f"❌ Не удалось сохранить фразу: {e}")
@@ -281,7 +344,7 @@ async def process_save_phrase(update: Update, phrase_text: str):
 
 def generate_rag_answer_sync(query: str) -> tuple[str, list]:
     """
-    Синхронный RAG: поиск совпадений в Pinecone и генерация ответа через OpenRouter.
+    Синхронный RAG: поиск совпадений в Pinecone и генерация ответа через OpenRouter/OpenAI.
     """
     matches = pinecone_client.search_by_text(
         query_text=query,
@@ -330,27 +393,13 @@ def generate_rag_answer_sync(query: str) -> tuple[str, list]:
     return answer, matches
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_rag_question(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
     """
-    Основной обработчик текстовых сообщений:
-    1. Если триггер сохранения («Запомни: ...») -> сохраняет в Pinecone.
-    2. Иначе -> выполняет семантический поиск и генерирует RAG-ответ.
+    Обработка вопроса: поиск в базе знаний и генерация ответа наставника.
     """
-    text = update.message.text.strip()
-    if not text:
-        return
-
-    # Проверяем на триггеры сохранения
-    save_text = extract_save_text(text)
-    if save_text:
-        await process_save_phrase(update, save_text)
-        return
-
-    # Во всех остальных случаях — это вопрос к базе
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
     try:
-        answer, matches = await asyncio.to_thread(generate_rag_answer_sync, text)
+        answer, matches = await asyncio.to_thread(generate_rag_answer_sync, query)
 
         # Формируем красивый блок с источниками
         sources_text = ""
@@ -366,14 +415,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         full_message = f"{answer}{sources_text}"
         await update.message.reply_text(full_message, parse_mode=ParseMode.HTML)
-
     except Exception as e:
         logger.error(f"Ошибка при обработке вопроса: {e}")
-        # Если Telegram отклонил HTML-разметку из-за спецсимволов, пробуем отправить без Markdown/HTML
         try:
             await update.message.reply_text(f"🙏 {answer}")
         except Exception:
             await update.message.reply_text(f"❌ Произошла ошибка при формировании ответа: {e}")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Основной обработчик текстовых сообщений:
+    1. Если триггер сохранения («Запомни: ...») -> сохраняет в Pinecone.
+    2. Если вопрос ('?' или вопросительные слова) -> генерация RAG-ответа.
+    3. Обычное сообщение пользователя (мысль/цитата) -> сохранение в Pinecone с автоматической дедупликацией!
+    """
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    # Проверяем явные триггеры сохранения
+    save_text = extract_save_text(text)
+    if save_text:
+        await process_save_phrase(update, save_text)
+        return
+
+    # Если это вопрос — отвечаем через RAG
+    if is_question_message(text):
+        await handle_rag_question(update, context, text)
+        return
+
+    # Во всех остальных случаях обычное сообщение пользователя направляется
+    # на векторизацию и сохранение в базу знаний с дедупликацией (action: created / action: skipped)
+    await process_save_phrase(update, text)
 
 
 # ------------------------------------------------------------------------------
@@ -390,6 +464,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("add", add_command))
+    app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("search", search_command))
 
     # Регистрируем обработчик текстовых сообщений

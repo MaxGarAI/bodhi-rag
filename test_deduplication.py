@@ -78,50 +78,96 @@ def test_filter_duplicate_results():
 def test_live_pinecone_deduplication():
     print("\n--- Тест 4: Проверка дедупликации в реальном индексе Pinecone ---")
     index_name = os.getenv("PINECONE_INDEX", "test2")
-    namespace = "buddhism"
+    test_ns = f"test_dedup_{int(time.time())}"
 
     client = PineconeManager(index_name=index_name, duplicate_threshold=0.88)
-    print(f"Подключено к индексу '{index_name}', раздел '{namespace}', порог: {client.duplicate_threshold}")
+    print(f"Подключено к индексу '{index_name}', временный раздел '{test_ns}', порог: {client.duplicate_threshold}")
 
-    # Известная фраза, которая уже есть в базе знаний буддизма
-    existing_phrase = "Спокойствие приходит изнутри. Не ищи его снаружи."
+    ts = int(time.time())
+    base_phrase = f"Истинный покой обретается в осознанности и тишине сердца {ts}"
+    similar_phrase = f"Истинный покой обретается в осознанности и тишине сердца! {ts}"
+    updated_phrase = f"Истинный покой обретается в осознанности и глубокой тишине сердца {ts}"
 
-    print(f"\nПопытка добавить фразу-дубликат: «{existing_phrase}»...")
-    res_dup = client.upsert_text(
-        id=f"test-dup-{int(time.time())}",
-        text=existing_phrase,
-        namespace=namespace,
+    print(f"\n1. Добавление первой фразы (ожидаем action: created)...")
+    res1 = client.upsert_text(
+        id=f"test-orig-{ts}",
+        text=base_phrase,
+        namespace=test_ns,
         filter_duplicates=True,
     )
+    print(f" Результат 1: action = {res1.get('action')}, id = {res1.get('id')}")
+    assert res1.get("action") == "created", f"Ожидалось action: created, получено {res1.get('action')}"
+    print(" [OK] action: created подтверждено!")
 
-    print(f"Результат проверки: is_duplicate = {res_dup.get('is_duplicate')}")
-    if res_dup.get("is_duplicate"):
-        dup_info = res_dup.get("duplicate", {})
-        score = dup_info.get("score", 0.0)
-        print(f" [OK] Дубликат успешно обнаружен! Сходство: {score * 100:.2f}% (порог: {res_dup.get('threshold') * 100:.0f}%)")
-        print(f"      Совпал с существующей записью ID: '{dup_info.get('id')}'")
-        print(f"      Текст в базе: «{dup_info.get('text')}»")
-    else:
-        print(" [INFO] Точного дубликата в базе не нашлось (возможно, база еще не заполнена этими фразами).")
+    # Небольшая пауза для индексации вектора в Pinecone
+    time.sleep(1.5)
 
-    print("\nПроверка пакетного сохранения с внутренней дедупликацией (upsert_texts)...")
+    print(f"\n2. Добавление похожей фразы с on_duplicate='skip' (ожидаем action: skipped)...")
+    res2 = client.upsert_text(
+        id=f"test-skip-{ts}",
+        text=similar_phrase,
+        namespace=test_ns,
+        filter_duplicates=True,
+        on_duplicate="skip",
+    )
+    print(f" Результат 2: action = {res2.get('action')}, is_duplicate = {res2.get('is_duplicate')}")
+    assert res2.get("action") == "skipped", f"Ожидалось action: skipped, получено {res2.get('action')}"
+    assert res2.get("is_duplicate") is True, "Ожидалось is_duplicate == True"
+    print(" [OK] action: skipped подтверждено!")
+
+    print(f"\n3. Добавление похожей фразы с on_duplicate='update' (ожидаем action: updated)...")
+    res3 = client.upsert_text(
+        id=f"test-update-{ts}",
+        text=updated_phrase,
+        namespace=test_ns,
+        filter_duplicates=True,
+        on_duplicate="update",
+    )
+    print(f" Результат 3: action = {res3.get('action')}, is_duplicate = {res3.get('is_duplicate')}")
+    assert res3.get("action") == "updated", f"Ожидалось action: updated, получено {res3.get('action')}"
+    assert res3.get("is_duplicate") is True, "Ожидалось is_duplicate == True"
+    print(" [OK] action: updated подтверждено!")
+
+    print("\n4. Проверка пакетного сохранения с внутренней дедупликацией (upsert_texts)...")
     batch_items = [
-        {"id": "b1", "text": "Ум — это всё. Чем ты думаешь, тем ты и становишься."},
-        {"id": "b2", "text": "Ум — это абсолютно всё. О чем ты думаешь, тем ты и становишься."},  # дубликат b1
+        {"id": f"b1-{ts}", "text": f"Ум — это всё. Чем ты думаешь, тем ты и становишься {ts}."},
+        {"id": f"b2-{ts}", "text": f"Ум — это абсолютно всё. Чем ты думаешь, тем ты и становишься {ts}."},
     ]
     batch_res = client.upsert_texts(
         items=batch_items,
-        namespace="test_dedup_tmp",
+        namespace=test_ns,
         filter_duplicates=True,
         duplicate_threshold=0.88,
     )
     print(f"Результат пакета: записано: {batch_res['upserted_count']}, пропущено дубликатов: {batch_res['skipped_duplicates_count']}")
-    assert batch_res["skipped_duplicates_count"] >= 1, "Ожидалось отсечение хотя бы одного дубликата в пакете"
+    assert batch_res["skipped_duplicates_count"] >= 1, "Ожидалось отсечение дубликата в пакете"
     print(" [OK] Внутренняя дедупликация пакета сработала успешно!")
 
-    # Очистим временный неймспейс
-    client.delete_vectors(delete_all=True, namespace="test_dedup_tmp")
-    print(" [OK] Временный тестовый раздел очищен.")
+    # Очистим временный тестовый неймспейс
+    client.delete_vectors(delete_all=True, namespace=test_ns)
+    print(f" [OK] Временный тестовый раздел '{test_ns}' очищен.")
+
+
+def test_verify_log_file():
+    print("\n--- Тест 5: Проверка наличия записей в файле deduplication.log ---")
+    log_file = os.getenv("LOG_FILE", "deduplication.log")
+    assert os.path.exists(log_file), f"Файл логов {log_file} не найден!"
+
+    with open(log_file, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    has_created = "action: created" in content
+    has_skipped = "action: skipped" in content
+    has_updated = "action: updated" in content
+
+    print(f" Найдено 'action: created': {has_created}")
+    print(f" Найдено 'action: skipped': {has_skipped}")
+    print(f" Найдено 'action: updated': {has_updated}")
+
+    assert has_created, "Лог не содержит записей 'action: created'"
+    assert has_skipped, "Лог не содержит записей 'action: skipped'"
+    assert has_updated, "Лог не содержит записей 'action: updated'"
+    print(f" [OK] Файл {log_file} содержит все требуемые результаты логирования!")
 
 
 if __name__ == "__main__":
@@ -129,6 +175,8 @@ if __name__ == "__main__":
     test_alias_and_defaults()
     test_filter_duplicate_results()
     test_live_pinecone_deduplication()
+    test_verify_log_file()
     print("\n==============================================")
     print(" ВСЕ ТЕСТЫ ДЕДУПЛИКАЦИИ УСПЕШНО ПРОЙДЕНЫ!")
     print("==============================================\n")
+
