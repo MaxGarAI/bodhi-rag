@@ -292,54 +292,62 @@ async def process_save_phrase(update: Update, phrase_text: str):
             filter_duplicates=True,
             on_duplicate="skip",
         )
-
-        action = res.get("action", "created")
-
-        if action == "skipped":
-            dup = res.get("duplicate") or {}
-            dup_meta = dup.get("metadata") or {}
-            dup_text = dup.get("text") or dup_meta.get("text") or "..."
-            dup_author = dup_meta.get("author") or "Неизвестен"
-            dup_id = dup.get("id") or "..."
-            dup_score = dup.get("score", 0.0) * 100
-            threshold_pct = res.get("threshold", 0.88) * 100
-
-            warning_text = (
-                "⚠️ <b>Похожая мысль уже есть в базе знаний! [action: skipped]</b>\n\n"
-                f"📊 Косинусное сходство: <b>{dup_score:.1f}%</b> (порог: {threshold_pct:.0f}%)\n"
-                f"📝 <b>Существующая запись:</b> «{dup_text}»\n"
-                f"👤 <b>Автор:</b> {dup_author}\n"
-                f"🔑 <b>ID:</b> <code>{dup_id}</code>\n\n"
-                "🛡️ <i>Запись автоматически отфильтрована во избежание дублирования данных.</i>"
-            )
-            await status_msg.edit_text(warning_text, parse_mode=ParseMode.HTML)
-            return
-
-        elif action == "updated":
-            dup = res.get("duplicate") or {}
-            dup_score = dup.get("score", 0.0) * 100
-            updated_text = (
-                "🔄 <b>Запись успешно обновлена! [action: updated]</b>\n\n"
-                f"📊 Обнаружено сходство: <b>{dup_score:.1f}%</b>\n"
-                f"📝 <b>Обновленный текст:</b> «{phrase_text}»\n"
-                f"👤 <b>Автор:</b> {author_name}\n"
-                f"🔑 <b>ID:</b> <code>{res.get('id', phrase_id)}</code>"
-            )
-            await status_msg.edit_text(updated_text, parse_mode=ParseMode.HTML)
-            return
-
-        else:
-            success_text = (
-                "✅ <b>Фраза успешно сохранена в базу знаний! [action: created]</b>\n\n"
-                f"📝 <b>Текст:</b> «{phrase_text}»\n"
-                f"👤 <b>Автор:</b> {author_name}\n"
-                f"🔑 <b>ID:</b> <code>{phrase_id}</code>\n\n"
-                "✨ Теперь эта мысль участвует в поиске и будет использоваться в ответах на вопросы!"
-            )
-            await status_msg.edit_text(success_text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.error(f"Ошибка сохранения фразы: {e}")
-        await status_msg.edit_text(f"❌ Не удалось сохранить фразу: {e}")
+        logger.error(f"Ошибка сохранения фразы в Pinecone: {e}")
+        try:
+            await status_msg.edit_text(f"❌ Не удалось сохранить фразу: {e}")
+        except Exception:
+            await update.message.reply_text(f"❌ Не удалось сохранить фразу: {e}")
+        return
+
+    action = res.get("action", "created")
+
+    if action == "skipped":
+        dup = res.get("duplicate") or {}
+        dup_meta = dup.get("metadata") or {}
+        dup_text = dup.get("text") or dup_meta.get("text") or "..."
+        dup_author = dup_meta.get("author") or "Неизвестен"
+        dup_id = dup.get("id") or "..."
+        dup_score = dup.get("score", 0.0) * 100
+        threshold_pct = res.get("threshold", 0.88) * 100
+
+        result_text = (
+            "⚠️ <b>Похожая мысль уже есть в базе знаний! [action: skipped]</b>\n\n"
+            f"📊 Косинусное сходство: <b>{dup_score:.1f}%</b> (порог: {threshold_pct:.0f}%)\n"
+            f"📝 <b>Существующая запись:</b> «{dup_text}»\n"
+            f"👤 <b>Автор:</b> {dup_author}\n"
+            f"🔑 <b>ID:</b> <code>{dup_id}</code>\n\n"
+            "🛡️ <i>Запись автоматически отфильтрована во избежание дублирования данных.</i>"
+        )
+    elif action == "updated":
+        dup = res.get("duplicate") or {}
+        dup_score = dup.get("score", 0.0) * 100
+        result_text = (
+            "🔄 <b>Запись успешно обновлена! [action: updated]</b>\n\n"
+            f"📊 Обнаружено сходство: <b>{dup_score:.1f}%</b>\n"
+            f"📝 <b>Обновленный текст:</b> «{phrase_text}»\n"
+            f"👤 <b>Автор:</b> {author_name}\n"
+            f"🔑 <b>ID:</b> <code>{res.get('id', phrase_id)}</code>"
+        )
+    else:
+        result_text = (
+            "✅ <b>Фраза успешно сохранена в базу знаний! [action: created]</b>\n\n"
+            f"📝 <b>Текст:</b> «{phrase_text}»\n"
+            f"👤 <b>Автор:</b> {author_name}\n"
+            f"🔑 <b>ID:</b> <code>{phrase_id}</code>\n\n"
+            "✨ Теперь эта мысль участвует в поиске и будет использоваться в ответах на вопросы!"
+        )
+
+    # Безопасное обновление статуса с повторной попыткой при разрыве соединения Telegram
+    try:
+        await status_msg.edit_text(result_text, parse_mode=ParseMode.HTML)
+    except Exception as edit_err:
+        logger.warning(f"Не удалось обновить статусное сообщение ({edit_err}), отправляю новое...")
+        try:
+            await update.message.reply_text(result_text, parse_mode=ParseMode.HTML)
+        except Exception as send_err:
+            logger.error(f"Не удалось отправить уведомление пользователю: {send_err}")
+
 
 
 def generate_rag_answer_sync(query: str) -> tuple[str, list]:

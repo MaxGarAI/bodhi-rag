@@ -10,3 +10,15 @@
 2026-10-09 11:18:54,348 - INFO - action: skipped | in_batch_duplicate of 'b1-1791533925' | similarity: 0.9575 >= 0.88 | text: 'Ум — это абсолютно всё. Чем ты думаешь, тем ты и становишься 1791533925.'
 2026-10-09 11:18:54,905 - INFO - Успешно записано 1 векторов в индекс 'test2' (пакетов: 1, namespace: 'test_dedup_1791533921').
 2026-10-09 11:18:55,289 - INFO - Успешно удалены векторы из 'test2' (ids=None, delete_all=True, namespace='test_dedup_1791533921').
+2026-10-09 11:23:12,412 - INFO - Клиент эмбеддингов инициализирован (base_url: 'https://openrouter.ai/api/v1', модель: 'openai/text-embedding-3-small')
+2026-10-09 11:23:18,363 - INFO - Успешно подключено к индексу Pinecone: 'test2'
+2026-10-09 11:23:18,363 - INFO - Запуск Telegram-бота «Лотос Мудрости»...
+2026-10-09 11:23:18,954 - INFO - Бот успешно запущен и ожидает сообщений!
+2026-10-09 11:23:47,896 - INFO - Успешно записано 1 векторов в индекс 'test2' (пакетов: 1, namespace: 'buddhism').
+2026-10-09 11:23:47,897 - INFO - action: created | id: 'buddhism-user-1791534224' | text: 'hi'
+2026-10-09 11:23:49,024 - ERROR - Ошибка сохранения фразы: httpx.RemoteProtocolError: Server disconnected without sending a response.
+2026-10-09 11:24:46,869 - INFO - action: skipped | duplicate of id: 'buddhism-user-1791534224' | similarity: 1.0000 >= threshold: 0.88 | text: 'hi'
+2026-10-09 11:31:11,834 - INFO - Успешно записано 1 векторов в индекс 'test2' (пакетов: 1, namespace: 'buddhism').
+2026-10-09 11:31:11,835 - INFO - action: created | id: 'buddhism-user-1791534668' | text: 'Чему по природе присуще возникать, тому по природе присуще прекращаться'
+2026-10-09 11:31:12,967 - ERROR - Ошибка сохранения фразы: httpx.RemoteProtocolError: Server disconnected without sending a response.
+2026-10-09 11:31:25,527 - INFO - action: skipped | duplicate of id: 'buddhism-user-1791534668' | similarity: 1.0000 >= threshold: 0.88 | text: 'Чему по природе присуще возникать, тому по природе присуще прекращаться'
