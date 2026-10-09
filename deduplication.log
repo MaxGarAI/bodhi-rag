@@ -22,3 +22,19 @@
 2026-10-09 11:31:11,835 - INFO - action: created | id: 'buddhism-user-1791534668' | text: 'Чему по природе присуще возникать, тому по природе присуще прекращаться'
 2026-10-09 11:31:12,967 - ERROR - Ошибка сохранения фразы: httpx.RemoteProtocolError: Server disconnected without sending a response.
 2026-10-09 11:31:25,527 - INFO - action: skipped | duplicate of id: 'buddhism-user-1791534668' | similarity: 1.0000 >= threshold: 0.88 | text: 'Чему по природе присуще возникать, тому по природе присуще прекращаться'
+2026-10-09 11:36:13,413 - INFO - Клиент эмбеддингов инициализирован (base_url: 'https://openrouter.ai/api/v1', модель: 'openai/text-embedding-3-small')
+2026-10-09 11:36:15,763 - INFO - Успешно подключено к индексу Pinecone: 'test2'
+2026-10-09 11:36:15,764 - INFO - Запуск Telegram-бота «Лотос Мудрости»...
+2026-10-09 11:36:16,309 - INFO - Бот успешно запущен и ожидает сообщений!
+2026-10-09 11:37:16,704 - ERROR - Ошибка при обработке вопроса: httpx.RemoteProtocolError: Server disconnected without sending a response.
+2026-10-09 11:41:50,895 - INFO - Успешно записано 1 векторов в индекс 'test2' (пакетов: 1, namespace: 'buddhism').
+2026-10-09 11:41:50,896 - INFO - action: created | id: 'buddhism-user-1791535308' | text: '• /search разбитый нос'
+2026-10-09 11:42:37,593 - INFO - Успешно записано 1 векторов в индекс 'test2' (пакетов: 1, namespace: 'buddhism').
+2026-10-09 11:42:37,593 - INFO - action: created | id: 'buddhism-user-1791535354' | text: 'разбитый нос'
+2026-10-09 11:42:49,273 - INFO - action: skipped | duplicate of id: 'buddhism-user-1791535354' | similarity: 0.9995 >= threshold: 0.88 | text: 'разбитый нос'
+2026-10-09 11:42:50,404 - WARNING - Не удалось обновить статусное сообщение (httpx.RemoteProtocolError: Server disconnected without sending a response.), отправляю новое...
+2026-10-09 11:42:51,690 - ERROR - Не удалось отправить уведомление пользователю: httpx.RemoteProtocolError: Server disconnected without sending a response.
+2026-10-09 11:49:15,333 - INFO - Клиент эмбеддингов инициализирован (base_url: 'https://openrouter.ai/api/v1', модель: 'openai/text-embedding-3-small')
+2026-10-09 11:49:47,401 - INFO - Клиент эмбеддингов инициализирован (base_url: 'https://openrouter.ai/api/v1', модель: 'openai/text-embedding-3-small')
+2026-10-09 11:49:49,492 - INFO - Успешно подключено к индексу Pinecone: 'test2'
+2026-10-09 11:49:51,449 - INFO - Успешно удалены векторы из 'test2' (ids=['buddhism-user-1791535308', 'buddhism-user-1791535354'], delete_all=False, namespace='buddhism').

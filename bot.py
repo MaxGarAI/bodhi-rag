@@ -16,10 +16,13 @@ import os
 import time
 import logging
 import asyncio
+import collections
+from typing import Optional
 from dotenv import load_dotenv
 
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -57,6 +60,65 @@ if not TELEGRAM_KEY:
 
 # Инициализация менеджера Pinecone
 pinecone_client = PineconeManager(index_name=INDEX_NAME)
+
+# ------------------------------------------------------------------------------
+# Дедупликация входящих событий Telegram (защита от двойных ответов при реконнекте)
+# ------------------------------------------------------------------------------
+_PROCESSED_UPDATES_DEQUE = collections.deque(maxlen=1000)
+_PROCESSED_UPDATES_SET = set()
+
+
+def is_duplicate_update(update_id: Optional[int]) -> bool:
+    """
+    Проверяет, обрабатывался ли уже данный update_id.
+    Предотвращает повторную генерацию ответов при сетевых перезапусках polling.
+    """
+    if update_id is None:
+        return False
+    if update_id in _PROCESSED_UPDATES_SET:
+        return True
+    _PROCESSED_UPDATES_SET.add(update_id)
+    _PROCESSED_UPDATES_DEQUE.append(update_id)
+    if len(_PROCESSED_UPDATES_SET) > 1000:
+        _PROCESSED_UPDATES_SET.clear()
+        _PROCESSED_UPDATES_SET.update(_PROCESSED_UPDATES_DEQUE)
+    return False
+
+
+# ------------------------------------------------------------------------------
+# Сетевые хелперы Telegram с защитой от RemoteProtocolError
+# ------------------------------------------------------------------------------
+async def safe_send_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Безопасная отправка статуса TYPING (не роняет выполнение при обрыве сети)."""
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception as e:
+        logger.debug(f"Игнорируем ошибку send_chat_action: {e}")
+
+
+async def safe_reply(message, text: str, parse_mode: Optional[str] = ParseMode.HTML, max_retries: int = 2):
+    """Безопасная отправка сообщения пользователю с автоматическим повтором при сбое сети."""
+    for attempt in range(max_retries):
+        try:
+            return await message.reply_text(text, parse_mode=parse_mode)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Не удалось отправить сообщение после {max_retries} попыток: {e}")
+                raise
+            await asyncio.sleep(0.5)
+
+
+async def safe_edit(message, text: str, parse_mode: Optional[str] = ParseMode.HTML, max_retries: int = 2):
+    """Безопасное редактирование сообщения с автоматическим повтором."""
+    for attempt in range(max_retries):
+        try:
+            return await message.edit_text(text, parse_mode=parse_mode)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.warning(f"Не удалось отредактировать сообщение после {max_retries} попыток: {e}")
+                raise
+            await asyncio.sleep(0.5)
+
 
 # Триггеры для сохранения новых мыслей
 SAVE_TRIGGERS = (
@@ -113,6 +175,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /start — приветствие и краткое руководство.
     """
+    if is_duplicate_update(update.update_id):
+        return
+
     first_name = update.effective_user.first_name if update.effective_user else "друг"
     welcome_text = (
         f"🙏 <b>Приветствую, {first_name}!</b>\n\n"
@@ -133,13 +198,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /stats — количество векторов и статус базы знаний\n"
         "• /help — подробная справка"
     )
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
+    await safe_reply(update.message, welcome_text, parse_mode=ParseMode.HTML)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /help.
     """
+    if is_duplicate_update(update.update_id):
+        return
+
     help_text = (
         "📖 <b>Как пользоваться ботом:</b>\n\n"
         "• <b>Добавить мудрость:</b> Просто отправьте мне цитату или мысль (или используйте <code>/add ...</code> / <i>«Запомни: ...»</i>). "
@@ -151,15 +219,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <b>Статистика базы знаний:</b>\n"
         "  <code>/stats</code>"
     )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+    await safe_reply(update.message, help_text, parse_mode=ParseMode.HTML)
 
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /ask <вопрос> — явный вопрос к базе знаний с RAG-генерацией.
     """
+    if is_duplicate_update(update.update_id):
+        return
+
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(
+            update.message,
             "⚠️ Пожалуйста, укажите вопрос после команды.\n"
             "Пример: <code>/ask Как перестать тревожиться о будущем?</code>",
             parse_mode=ParseMode.HTML,
@@ -174,7 +246,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /stats — показывает состояние индекса Pinecone.
     """
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    if is_duplicate_update(update.update_id):
+        return
+
+    await safe_send_typing(context, update.effective_chat.id)
     try:
         stats = await asyncio.to_thread(pinecone_client.get_index_stats)
         namespaces = stats.get("namespaces", {})
@@ -191,18 +266,22 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• <b>Всего векторов в индексе:</b> <code>{total_count}</code>\n"
             f"• <b>Размерность векторов:</b> <code>{dimension}</code> dim"
         )
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        await safe_reply(update.message, msg, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Ошибка при получении статистики: {e}")
-        await update.message.reply_text(f"❌ Ошибка получения статистики: {e}")
+        await safe_reply(update.message, f"❌ Ошибка получения статистики: {e}")
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /add <текст> — явное добавление фразы в базу.
     """
+    if is_duplicate_update(update.update_id):
+        return
+
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(
+            update.message,
             "⚠️ Пожалуйста, укажите текст фразы после команды.\n"
             "Пример: <code>/add Спокойствие — величайшее проявление силы.</code>",
             parse_mode=ParseMode.HTML,
@@ -217,8 +296,12 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /search <запрос> — семантический поиск без генерации LLM.
     """
+    if is_duplicate_update(update.update_id):
+        return
+
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(
+            update.message,
             "⚠️ Укажите поисковый запрос.\n"
             "Пример: <code>/search как победить гнев</code>",
             parse_mode=ParseMode.HTML,
@@ -226,7 +309,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query = " ".join(context.args).strip()
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await safe_send_typing(context, update.effective_chat.id)
 
     try:
         matches = await asyncio.to_thread(
@@ -237,7 +320,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not matches:
-            await update.message.reply_text("🔍 Ничего не найдено в базе знаний.")
+            await safe_reply(update.message, "🔍 Ничего не найдено в базе знаний.")
             return
 
         response_lines = [f"🔍 <b>Результаты поиска по запросу:</b> <i>«{query}»</i>\n"]
@@ -253,10 +336,10 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<i>— {author}</i>\n"
             )
 
-        await update.message.reply_text("\n".join(response_lines), parse_mode=ParseMode.HTML)
+        await safe_reply(update.message, "\n".join(response_lines), parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Ошибка при поиске: {e}")
-        await update.message.reply_text(f"❌ Ошибка при поиске: {e}")
+        await safe_reply(update.message, f"❌ Ошибка при поиске: {e}")
 
 
 # ------------------------------------------------------------------------------
@@ -274,7 +357,14 @@ async def process_save_phrase(update: Update, phrase_text: str):
 
     phrase_id = f"buddhism-user-{int(time.time())}"
 
-    status_msg = await update.message.reply_text("⏳ <i>Проверяю дедупликацию и сохраняю в Pinecone...</i>", parse_mode=ParseMode.HTML)
+    try:
+        status_msg = await safe_reply(
+            update.message,
+            "⏳ <i>Проверяю дедупликацию и сохраняю в Pinecone...</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        status_msg = None
 
     try:
         res = await asyncio.to_thread(
@@ -294,10 +384,14 @@ async def process_save_phrase(update: Update, phrase_text: str):
         )
     except Exception as e:
         logger.error(f"Ошибка сохранения фразы в Pinecone: {e}")
-        try:
-            await status_msg.edit_text(f"❌ Не удалось сохранить фразу: {e}")
-        except Exception:
-            await update.message.reply_text(f"❌ Не удалось сохранить фразу: {e}")
+        err_msg = f"❌ Не удалось сохранить фразу: {e}"
+        if status_msg:
+            try:
+                await safe_edit(status_msg, err_msg)
+                return
+            except Exception:
+                pass
+        await safe_reply(update.message, err_msg)
         return
 
     action = res.get("action", "created")
@@ -338,16 +432,15 @@ async def process_save_phrase(update: Update, phrase_text: str):
             "✨ Теперь эта мысль участвует в поиске и будет использоваться в ответах на вопросы!"
         )
 
-    # Безопасное обновление статуса с повторной попыткой при разрыве соединения Telegram
-    try:
-        await status_msg.edit_text(result_text, parse_mode=ParseMode.HTML)
-    except Exception as edit_err:
-        logger.warning(f"Не удалось обновить статусное сообщение ({edit_err}), отправляю новое...")
+    # Безопасное обновление статуса
+    if status_msg:
         try:
-            await update.message.reply_text(result_text, parse_mode=ParseMode.HTML)
-        except Exception as send_err:
-            logger.error(f"Не удалось отправить уведомление пользователю: {send_err}")
+            await safe_edit(status_msg, result_text, parse_mode=ParseMode.HTML)
+            return
+        except Exception as edit_err:
+            logger.warning(f"Не удалось обновить статусное сообщение ({edit_err}), отправляю новое...")
 
+    await safe_reply(update.message, result_text, parse_mode=ParseMode.HTML)
 
 
 def generate_rag_answer_sync(query: str) -> tuple[str, list]:
@@ -405,7 +498,7 @@ async def handle_rag_question(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     Обработка вопроса: поиск в базе знаний и генерация ответа наставника.
     """
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await safe_send_typing(context, update.effective_chat.id)
     try:
         answer, matches = await asyncio.to_thread(generate_rag_answer_sync, query)
 
@@ -422,40 +515,77 @@ async def handle_rag_question(update: Update, context: ContextTypes.DEFAULT_TYPE
             sources_text = "\n".join(sources_lines)
 
         full_message = f"{answer}{sources_text}"
-        await update.message.reply_text(full_message, parse_mode=ParseMode.HTML)
+        await safe_reply(update.message, full_message, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Ошибка при обработке вопроса: {e}")
         try:
-            await update.message.reply_text(f"🙏 {answer}")
+            await safe_reply(update.message, f"🙏 {answer}")
         except Exception:
-            await update.message.reply_text(f"❌ Произошла ошибка при формировании ответа: {e}")
+            await safe_reply(update.message, f"❌ Произошла ошибка при формировании ответа: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Основной обработчик текстовых сообщений:
-    1. Если триггер сохранения («Запомни: ...») -> сохраняет в Pinecone.
-    2. Если вопрос ('?' или вопросительные слова) -> генерация RAG-ответа.
-    3. Обычное сообщение пользователя (мысль/цитата) -> сохранение в Pinecone с автоматической дедупликацией!
+    1. Защита от повторной обработки update_id.
+    2. Очистка маркёров списков ('•', '-', '*') перед командами.
+    3. Если триггер сохранения («Запомни: ...») -> сохраняет в Pinecone.
+    4. Если вопрос ('?' или вопросительные слова) -> генерация RAG-ответа.
+    5. Обычное сообщение пользователя (мысль/цитата) -> сохранение в Pinecone с автоматической дедупликацией!
     """
-    text = update.message.text.strip()
-    if not text:
+    if is_duplicate_update(update.update_id):
         return
 
-    # Проверяем явные триггеры сохранения
-    save_text = extract_save_text(text)
+    raw_text = update.message.text.strip()
+    if not raw_text:
+        return
+
+    # Очищаем маркеры списков и спецсимволы в начале строки (например, «• /search ...» или «- /ask ...»)
+    cleaned_text = raw_text.lstrip("•*-—– \t")
+
+    # Если после очистки маркёров это команда — направляем в соответствующую команду, а не в цитаты!
+    if cleaned_text.startswith("/"):
+        parts = cleaned_text.split(maxsplit=1)
+        cmd = parts[0][1:].lower()
+        args = parts[1].split() if len(parts) > 1 else []
+        context.args = args
+
+        if cmd == "search":
+            await search_command(update, context)
+            return
+        elif cmd == "ask":
+            await ask_command(update, context)
+            return
+        elif cmd == "stats":
+            await stats_command(update, context)
+            return
+        elif cmd == "add":
+            await add_command(update, context)
+            return
+        elif cmd == "help":
+            await help_command(update, context)
+            return
+        elif cmd == "start":
+            await start_command(update, context)
+            return
+        else:
+            await safe_reply(update.message, "⚠️ Неизвестная команда. Доступные команды: /help")
+            return
+
+    # Проверяем явные триггеры сохранения («Запомни: ...»)
+    save_text = extract_save_text(cleaned_text)
     if save_text:
         await process_save_phrase(update, save_text)
         return
 
     # Если это вопрос — отвечаем через RAG
-    if is_question_message(text):
-        await handle_rag_question(update, context, text)
+    if is_question_message(cleaned_text):
+        await handle_rag_question(update, context, cleaned_text)
         return
 
     # Во всех остальных случаях обычное сообщение пользователя направляется
     # на векторизацию и сохранение в базу знаний с дедупликацией (action: created / action: skipped)
-    await process_save_phrase(update, text)
+    await process_save_phrase(update, cleaned_text)
 
 
 # ------------------------------------------------------------------------------
@@ -465,7 +595,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     logger.info("Запуск Telegram-бота «Лотос Мудрости»...")
-    app = ApplicationBuilder().token(TELEGRAM_KEY).build()
+
+    # Настраиваем HTTPXRequest с пулом и увеличенными таймаутами для устойчивости к разрывам Telegram API
+    request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=10.0,
+    )
+    app = ApplicationBuilder().token(TELEGRAM_KEY).request(request).build()
 
     # Регистрируем команды
     app.add_handler(CommandHandler("start", start_command))
@@ -484,3 +623,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
